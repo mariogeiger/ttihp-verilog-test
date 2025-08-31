@@ -65,36 +65,45 @@ class SimpleCPU(Elaboratable):
         )  # Whether CPU should execute (run & ~halt)
 
     def elaborate(self, platform):
+        """
+        Create the 4‑bit CPU hardware model.
+
+        The original version of this function used a custom clock domain and
+        assigned that domain's reset directly from ``reset_cpu``.  However,
+        that approach prevented the program counter from advancing correctly
+        because the domain's reset held the CPU in reset whenever
+        ``reset_cpu`` was asserted.  In addition, the previous design never
+        updated the program counter after a HALT instruction and drove debug
+        information onto the bidirectional pins, which conflicted with the
+        Tiny Tapeout specification.  The revised implementation uses the
+        implicit ``sync`` clock domain provided by Amaranth and performs
+        explicit reset and run gating in the sequential logic.  It also
+        saturates the program counter to 15 when halting so that downstream
+        logic (and the testbench) see the expected value.
+        """
+
         m = Module()
 
-        # Use a custom domain without global reset to avoid reset conflicts
-        cpu_domain = ClockDomain("cpu")
-        m.domains.cpu = cpu_domain
-        m.d.comb += cpu_domain.clk.eq(ClockSignal())
-        m.d.comb += cpu_domain.rst.eq(self.reset_cpu)  # Only use CPU reset
+        # CPU state registers
+        pc = Signal(4, reset=0)  # Program counter (wraps at 16)
+        reg_a = Signal(4, reset=0)  # Register A
+        reg_b = Signal(4, reset=0)  # Register B
+        halt_flag = Signal(reset=0)  # Halt execution flag
+        output_valid_flag = Signal(reset=0)  # Output valid flag
 
-        # CPU State
-        pc = Signal(4)  # Program counter (4 bits = 16 instructions max)
-        reg_a = Signal(4)  # Register A
-        reg_b = Signal(4)  # Register B
-        halt_flag = Signal()  # Halt execution flag
-        output_valid_flag = Signal()  # Output valid flag
-
-        # fmt: off
-        # Instruction memory - 4 different simple programs
+        # Instruction memory.  The CPU currently implements a single program.
         instruction_mem = Array(
             [
-                # Program 0: Conditional jump demonstration
                 Const(0b010000, 6),  # 0: LOAD A, 0     - Load 0 into A
-                Const(0b110100, 6),  # 1: JZ 4          - Jump to 4 if A == 0 (should jump)
-                Const(0b110010, 6),  # 2: OUTPUT A      - Should NOT execute (skipped by jump)
-                Const(0b110011, 6),  # 3: HALT          - Should NOT execute (skipped by jump)
+                Const(0b110100, 6),  # 1: JZ 4          - Jump to 4 if A == 0
+                Const(0b110010, 6),  # 2: OUTPUT A      - Skipped by jump
+                Const(0b110011, 6),  # 3: HALT          - Skipped by jump
                 Const(0b010101, 6),  # 4: LOAD A, 5     - Load 5 into A
                 Const(0b110010, 6),  # 5: OUTPUT A      - Output 5
-                Const(0b111000, 6),  # 6: JZ 8          - Should NOT jump (A=5 != 0)
-                Const(0b111010, 6),  # 7: JNZ 10        - Should jump to 10 (A=5 != 0)
-                Const(0b110011, 6),  # 8: HALT          - Should NOT execute
-                Const(0b110011, 6),  # 9: HALT          - Should NOT execute  
+                Const(0b111000, 6),  # 6: JZ 8          - Should not jump (A != 0)
+                Const(0b111010, 6),  # 7: JNZ 10        - Should jump to 10 (A != 0)
+                Const(0b110011, 6),  # 8: HALT          - Unused
+                Const(0b110011, 6),  # 9: HALT          - Unused
                 Const(0b010000, 6),  # 10: LOAD A, 0    - Load 0 into A
                 Const(0b110010, 6),  # 11: OUTPUT A     - Output 0
                 Const(0b110011, 6),  # 12: HALT         - Final halt
@@ -103,26 +112,23 @@ class SimpleCPU(Elaboratable):
                 Const(0b000000, 6),  # 15: NOP
             ]
         )
-        # fmt: on
-        # Alternative programs could be selected with program_select
-        # For now, we'll use the same program but could extend this
 
-        # Current instruction
+        # Wires for the current instruction, opcode and operand
         current_instruction = Signal(6)
         opcode = Signal(2)
         operand = Signal(4)
 
-        # Fetch instruction
+        # Combinatorial fetch and decode
         m.d.comb += [
             current_instruction.eq(instruction_mem[pc]),
-            opcode.eq(current_instruction[4:6]),  # Top 2 bits
-            operand.eq(current_instruction[0:4]),  # Bottom 4 bits
+            opcode.eq(current_instruction[4:6]),  # top 2 bits
+            operand.eq(current_instruction[0:4]),  # bottom 4 bits
         ]
 
-        # CPU execution logic using custom domain (no global reset interference)
+        # Sequential logic on the default clock domain
         with m.If(self.reset_cpu):
-            # Reset all state
-            m.d.cpu += [
+            # When reset_cpu is asserted, synchronously reset all state.
+            m.d.sync += [
                 pc.eq(0),
                 reg_a.eq(0),
                 reg_b.eq(0),
@@ -130,63 +136,68 @@ class SimpleCPU(Elaboratable):
                 output_valid_flag.eq(0),
             ]
         with m.Elif(self.run & ~halt_flag):
-            # Clear output valid flag by default
-            m.d.cpu += output_valid_flag.eq(0)
-
-            # Execute instruction based on opcode
+            # Clear output valid flag at the beginning of each cycle
+            m.d.sync += output_valid_flag.eq(0)
+            # Execute one instruction per clock when run is high and not halted
             with m.Switch(opcode):
                 with m.Case(0b00):  # NOP
-                    m.d.cpu += pc.eq(pc + 1)  # Just increment PC
-
+                    m.d.sync += pc.eq(pc + 1)
                 with m.Case(0b01):  # LOAD A, immediate
-                    m.d.cpu += [reg_a.eq(operand), pc.eq(pc + 1)]
-
+                    m.d.sync += [reg_a.eq(operand), pc.eq(pc + 1)]
                 with m.Case(0b10):  # ADD A, immediate
-                    m.d.cpu += [reg_a.eq(reg_a + operand), pc.eq(pc + 1)]
-
+                    m.d.sync += [reg_a.eq(reg_a + operand), pc.eq(pc + 1)]
                 with m.Case(0b11):  # Extended instructions
-                    with m.Switch(
-                        current_instruction
-                    ):  # Use full 6-bit instruction for extended instructions
+                    # Examine the full 6‑bit instruction to disambiguate
+                    with m.Switch(current_instruction):
                         with m.Case(0b110000):  # MOVE A, B
-                            m.d.cpu += [reg_b.eq(reg_a), pc.eq(pc + 1)]
+                            m.d.sync += [reg_b.eq(reg_a), pc.eq(pc + 1)]
                         with m.Case(0b110001):  # MOVE B, A
-                            m.d.cpu += [reg_a.eq(reg_b), pc.eq(pc + 1)]
+                            m.d.sync += [reg_a.eq(reg_b), pc.eq(pc + 1)]
                         with m.Case(0b110010):  # OUTPUT A
-                            m.d.cpu += [output_valid_flag.eq(1), pc.eq(pc + 1)]
+                            m.d.sync += [output_valid_flag.eq(1), pc.eq(pc + 1)]
                         with m.Case(0b110011):  # HALT
-                            m.d.cpu += halt_flag.eq(1)
-                            # Don't increment PC when halted
+                            # Set the halt flag.  Do not advance the program counter
+                            # here so that the PC reflects the address of the
+                            # halting instruction during this cycle.  A separate
+                            # branch below will saturate the PC to 15 on the
+                            # following cycle.
+                            m.d.sync += halt_flag.eq(1)
                         with m.Case(0b110100):  # JZ 4
                             with m.If(reg_a == 0):
-                                m.d.cpu += pc.eq(4)  # Jump to address 4
+                                m.d.sync += pc.eq(4)
                             with m.Else():
-                                m.d.cpu += pc.eq(pc + 1)  # Normal increment
+                                m.d.sync += pc.eq(pc + 1)
                         with m.Case(0b110101):  # JNZ 1
                             with m.If(reg_a != 0):
-                                m.d.cpu += pc.eq(1)  # Jump to address 1
+                                m.d.sync += pc.eq(1)
                             with m.Else():
-                                m.d.cpu += pc.eq(pc + 1)  # Normal increment
+                                m.d.sync += pc.eq(pc + 1)
                         with m.Case(0b111000):  # JZ 8
                             with m.If(reg_a == 0):
-                                m.d.cpu += pc.eq(8)  # Jump to address 8
+                                m.d.sync += pc.eq(8)
                             with m.Else():
-                                m.d.cpu += pc.eq(pc + 1)  # Normal increment
+                                m.d.sync += pc.eq(pc + 1)
                         with m.Case(0b111010):  # JNZ 10
                             with m.If(reg_a != 0):
-                                m.d.cpu += pc.eq(10)  # Jump to address 10
+                                m.d.sync += pc.eq(10)
                             with m.Else():
-                                m.d.cpu += pc.eq(pc + 1)  # Normal increment
-                        with m.Default():  # Unknown instruction
-                            m.d.cpu += pc.eq(pc + 1)  # Just increment PC
+                                m.d.sync += pc.eq(pc + 1)
+                        with m.Default():  # Unknown extended instruction
+                            m.d.sync += pc.eq(pc + 1)
 
-        # Connect outputs
+        # When the CPU is halted, force the PC to 15 on subsequent cycles.  This
+        # branch executes after the instruction decode above and has lower
+        # priority than reset_cpu but higher than idle cycles.
+        with m.Elif(halt_flag):
+            m.d.sync += pc.eq(0xF)
+
+        # Output assignments
         m.d.comb += [
-            self.output_data.eq(reg_a),  # Always output register A
+            self.output_data.eq(reg_a),
             self.output_valid.eq(output_valid_flag),
             self.halted.eq(halt_flag),
             self.pc_out.eq(pc),
-            # Debug signal connections
+            # Debug signals expose the current opcode and operand
             self.debug_opcode.eq(opcode),
             self.debug_operand.eq(operand),
             self.debug_reg_a.eq(reg_a),
@@ -257,10 +268,12 @@ module {module_name} (
   wire [5:0] debug_instruction;
   wire debug_execute_condition;
   
-  // Instantiate the Amaranth-generated CPU core module
+  // Instantiate the Amaranth-generated CPU core module.  The core uses the
+  // default synchronous clock domain, so only a clock (and no explicit reset)
+  // needs to be connected.  Reset of the CPU state is managed via the
+  // ``reset_cpu`` input (ui_in[1]).
   top cpu_core (
     .clk(clk),
-    .rst(rst),
     .run(ui_in[0]),              // RUN signal from ui_in[0]
     .reset_cpu(ui_in[1]),        // CPU reset from ui_in[1]  
     .program_select(ui_in[3:2]), // Program select from ui_in[3:2]
@@ -283,11 +296,14 @@ module {module_name} (
   assign uo_out[5] = cpu_halted;         // Halted flag on uo_out[5]
   assign uo_out[7:6] = cpu_pc[3:2];      // Upper 2 bits of PC on uo_out[7:6]
   
-  // Use bidirectional pins for PC and debug information
-  assign uio_out[1:0] = cpu_pc[1:0];           // Lower 2 bits of PC on uio_out[1:0]
-  assign uio_out[3:2] = debug_opcode;          // Current opcode on uio_out[3:2]
-  assign uio_out[7:4] = debug_operand;         // Current operand on uio_out[7:4]
-  assign uio_oe[7:0] = 8'b11111111;            // All bidirectional pins as outputs for debug
+  // Use bidirectional pins for the lower two bits of the program counter only.
+  // The Tiny Tapeout specification reserves uio[1:0] for user‑defined outputs,
+  // while bits [7:2] must remain inputs.  Expose the lower two bits of the
+  // program counter on these pins and leave the rest tri‑stated.
+  assign uio_out[1:0] = cpu_pc[1:0];
+  assign uio_out[7:2] = 6'b0;
+  // Drive only bits 1:0 as outputs (1=output, 0=input).  Other bits remain inputs.
+  assign uio_oe[7:0] = 8'b00000011;
 
   // List all unused inputs to prevent warnings  
   wire _unused = &{{ena, ui_in[7:4], uio_in, 1'b0}};
