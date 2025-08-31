@@ -30,7 +30,7 @@ async def test_simple_cpu(dut):
         dut.ui_in.value = (prog_sel << 2) | (reset_cpu << 1) | run
         await ClockCycles(dut.clk, 1)
 
-    # Helper function to read CPU outputs
+    # Helper function to read CPU outputs and debug info
     def read_cpu_outputs():
         data_out = dut.uo_out.value & 0xF  # uo_out[3:0]
         output_valid = (dut.uo_out.value >> 4) & 1  # uo_out[4]
@@ -39,6 +39,66 @@ async def test_simple_cpu(dut):
         pc_lower = dut.uio_out.value & 3  # uio_out[1:0]
         pc = (pc_upper << 2) | pc_lower
         return data_out, output_valid, halted, pc
+
+    # Helper function to read debug information
+    def read_debug_info():
+        debug_opcode = (dut.uio_out.value >> 2) & 3  # uio_out[3:2]
+        debug_operand = (dut.uio_out.value >> 4) & 0xF  # uio_out[7:4]
+        return debug_opcode, debug_operand
+
+    # Enhanced debug logging function
+    def log_cpu_state(step_name, data_out, output_valid, halted, pc):
+        debug_opcode, debug_operand = read_debug_info()
+        opcode_names = {0: "NOP", 1: "LOAD", 2: "ADD", 3: "EXT"}
+        opcode_name = opcode_names.get(debug_opcode, "UNK")
+
+        # Decode the current instruction for better understanding
+        instruction_word = (debug_opcode << 4) | debug_operand
+        instruction_description = decode_instruction(debug_opcode, debug_operand)
+
+        dut._log.info(f"{step_name}:")
+        dut._log.info(
+            f"  STATE: PC={pc}, DATA={data_out}, VALID={output_valid}, HALTED={halted}"
+        )
+        dut._log.info(f"  INSTR: 0x{instruction_word:02x} = {instruction_description}")
+        dut._log.info(
+            f"  DEBUG: opcode={debug_opcode}({opcode_name}), operand=0x{debug_operand:x}"
+        )
+        dut._log.info(
+            f"  RAW: uo_out=0x{int(dut.uo_out.value):02x}, uio_out=0x{int(dut.uio_out.value):02x}"
+        )
+        dut._log.info("")
+
+    # Instruction decoder for debug output
+    def decode_instruction(opcode, operand):
+        if opcode == 0:
+            return "NOP"
+        elif opcode == 1:
+            return f"LOAD A, {operand}"
+        elif opcode == 2:
+            return f"ADD A, {operand}"
+        elif opcode == 3:
+            full_instr = (opcode << 4) | operand
+            if full_instr == 0x30:
+                return "MOVE A, B"
+            elif full_instr == 0x31:
+                return "MOVE B, A"
+            elif full_instr == 0x32:
+                return "OUTPUT A"
+            elif full_instr == 0x33:
+                return "HALT"
+            elif full_instr == 0x34:
+                return "JZ 4"
+            elif full_instr == 0x35:
+                return "JNZ 1"
+            elif full_instr == 0x38:
+                return "JZ 8"
+            elif full_instr == 0x3A:
+                return "JNZ 10"
+            else:
+                return f"UNKNOWN_EXT(0x{full_instr:02x})"
+        else:
+            return f"INVALID_OPCODE({opcode})"
 
     # Test 1: CPU Reset Test
     dut._log.info("Test 1: CPU Reset")
@@ -54,35 +114,48 @@ async def test_simple_cpu(dut):
 
     # Test 2: Run CPU Program with Conditional Jumps
     dut._log.info("Test 2: Run CPU Program with Conditional Jumps")
+
+    # First make sure CPU is not in reset
+    await set_cpu_inputs(run=0, reset_cpu=0, prog_sel=0)
+    await ClockCycles(dut.clk, 2)
+
+    # Now start the CPU
     await set_cpu_inputs(run=1, reset_cpu=0, prog_sel=0)
+    await ClockCycles(dut.clk, 2)  # Give CPU time to start
+
+    # Check initial state after starting
+    data_out, output_valid, halted, pc = read_cpu_outputs()
+    log_cpu_state("Initial CPU State", data_out, output_valid, halted, pc)
+    dut._log.info(
+        f"Input signals: ui_in=0x{int(dut.ui_in.value):02x}, rst_n={dut.rst_n.value}, ena={dut.ena.value}"
+    )
+    dut._log.info("")
 
     expected_sequence = [
-        # PC=0: LOAD A, 0 -> A=0
+        # After PC=0: LOAD A, 0 -> A=0, PC will become 1 next cycle
         {"pc": 1, "data": 0, "valid": 0},
-        # PC=1: JZ 4 -> Jump to 4 (since A=0)
+        # After PC=1: JZ 4 -> Jump to 4 (since A=0), PC becomes 4
         {"pc": 4, "data": 0, "valid": 0},
-        # PC=4: LOAD A, 5 -> A=5
+        # After PC=4: LOAD A, 5 -> A=5, PC becomes 5
         {"pc": 5, "data": 5, "valid": 0},
-        # PC=5: OUTPUT A -> Output A=5, set valid flag
+        # After PC=5: OUTPUT A -> Output A=5, set valid flag, PC becomes 6
         {"pc": 6, "data": 5, "valid": 1},
-        # PC=6: JZ 8 -> Should NOT jump (A=5 != 0), continue to PC=7
+        # After PC=6: JZ 8 -> Should NOT jump (A=5 != 0), PC becomes 7
         {"pc": 7, "data": 5, "valid": 0},
-        # PC=7: JNZ 10 -> Jump to 10 (since A=5 != 0)
+        # After PC=7: JNZ 10 -> Jump to 10 (since A=5 != 0), PC becomes 10
         {"pc": 10, "data": 5, "valid": 0},
-        # PC=10: LOAD A, 0 -> A=0
+        # After PC=10: LOAD A, 0 -> A=0, PC becomes 11
         {"pc": 11, "data": 0, "valid": 0},
-        # PC=11: OUTPUT A -> Output A=0, set valid flag
+        # After PC=11: OUTPUT A -> Output A=0, set valid flag, PC becomes 12
         {"pc": 12, "data": 0, "valid": 1},
-        # PC=12: HALT -> should halt execution
+        # After PC=12: HALT -> should halt execution, PC stays at 12
         {"pc": 12, "data": 0, "valid": 0, "halted": 1},
     ]
 
     for i, expected in enumerate(expected_sequence):
-        await ClockCycles(dut.clk, 1)
+        await ClockCycles(dut.clk, 2)  # Give more time for PC to update
         data_out, output_valid, halted, pc = read_cpu_outputs()
-        dut._log.info(
-            f"Step {i}: PC={pc}, DATA={data_out}, VALID={output_valid}, HALTED={halted}"
-        )
+        log_cpu_state(f"Step {i}", data_out, output_valid, halted, pc)
 
         assert pc == expected["pc"], f"Step {i}: Expected PC={expected['pc']}, got {pc}"
         assert data_out == expected["data"], (

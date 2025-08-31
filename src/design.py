@@ -2,8 +2,18 @@
 import os
 
 import yaml
-from amaranth import Elaboratable, Module, Signal, Array, Const
+from amaranth import (
+    Elaboratable,
+    Module,
+    Signal,
+    Array,
+    Const,
+    ClockDomain,
+    ClockSignal,
+)
 from amaranth.back import verilog
+
+# After editing this file, don't forget to edit info.yaml and test/tb.v and also test/test.py
 
 
 class SimpleCPU(Elaboratable):
@@ -44,8 +54,24 @@ class SimpleCPU(Elaboratable):
             4
         )  # Program counter for debugging (uo_out[7:6] + uio_out[1:0])
 
+        # Debug outputs (additional signals for debugging)
+        self.debug_opcode = Signal(2)  # Current instruction opcode
+        self.debug_operand = Signal(4)  # Current instruction operand
+        self.debug_reg_a = Signal(4)  # Register A contents
+        self.debug_reg_b = Signal(4)  # Register B contents
+        self.debug_instruction = Signal(6)  # Full current instruction
+        self.debug_execute_condition = (
+            Signal()
+        )  # Whether CPU should execute (run & ~halt)
+
     def elaborate(self, platform):
         m = Module()
+
+        # Use a custom domain without global reset to avoid reset conflicts
+        cpu_domain = ClockDomain("cpu")
+        m.domains.cpu = cpu_domain
+        m.d.comb += cpu_domain.clk.eq(ClockSignal())
+        m.d.comb += cpu_domain.rst.eq(self.reset_cpu)  # Only use CPU reset
 
         # CPU State
         pc = Signal(4)  # Program counter (4 bits = 16 instructions max)
@@ -53,7 +79,6 @@ class SimpleCPU(Elaboratable):
         reg_b = Signal(4)  # Register B
         halt_flag = Signal()  # Halt execution flag
         output_valid_flag = Signal()  # Output valid flag
-        jump_flag = Signal()  # Flag to indicate if a jump occurred this cycle
 
         # fmt: off
         # Instruction memory - 4 different simple programs
@@ -94,72 +119,66 @@ class SimpleCPU(Elaboratable):
             operand.eq(current_instruction[0:4]),  # Bottom 4 bits
         ]
 
-        # CPU execution logic
+        # CPU execution logic using custom domain (no global reset interference)
         with m.If(self.reset_cpu):
             # Reset all state
-            m.d.sync += [
+            m.d.cpu += [
                 pc.eq(0),
                 reg_a.eq(0),
                 reg_b.eq(0),
                 halt_flag.eq(0),
                 output_valid_flag.eq(0),
-                jump_flag.eq(0),
             ]
         with m.Elif(self.run & ~halt_flag):
-            # Clear output valid and jump flags by default
-            m.d.sync += [output_valid_flag.eq(0), jump_flag.eq(0)]
+            # Clear output valid flag by default
+            m.d.cpu += output_valid_flag.eq(0)
 
             # Execute instruction based on opcode
             with m.Switch(opcode):
                 with m.Case(0b00):  # NOP
-                    pass  # Do nothing
+                    m.d.cpu += pc.eq(pc + 1)  # Just increment PC
 
                 with m.Case(0b01):  # LOAD A, immediate
-                    m.d.sync += reg_a.eq(operand)
+                    m.d.cpu += [reg_a.eq(operand), pc.eq(pc + 1)]
 
                 with m.Case(0b10):  # ADD A, immediate
-                    m.d.sync += reg_a.eq(reg_a + operand)
+                    m.d.cpu += [reg_a.eq(reg_a + operand), pc.eq(pc + 1)]
 
                 with m.Case(0b11):  # Extended instructions
                     with m.Switch(
                         current_instruction
                     ):  # Use full 6-bit instruction for extended instructions
                         with m.Case(0b110000):  # MOVE A, B
-                            m.d.sync += reg_b.eq(reg_a)
+                            m.d.cpu += [reg_b.eq(reg_a), pc.eq(pc + 1)]
                         with m.Case(0b110001):  # MOVE B, A
-                            m.d.sync += reg_a.eq(reg_b)
+                            m.d.cpu += [reg_a.eq(reg_b), pc.eq(pc + 1)]
                         with m.Case(0b110010):  # OUTPUT A
-                            m.d.sync += output_valid_flag.eq(1)
+                            m.d.cpu += [output_valid_flag.eq(1), pc.eq(pc + 1)]
                         with m.Case(0b110011):  # HALT
-                            m.d.sync += halt_flag.eq(1)
+                            m.d.cpu += halt_flag.eq(1)
+                            # Don't increment PC when halted
                         with m.Case(0b110100):  # JZ 4
                             with m.If(reg_a == 0):
-                                m.d.sync += [
-                                    pc.eq(4),  # Jump to address 4
-                                    jump_flag.eq(1),
-                                ]
+                                m.d.cpu += pc.eq(4)  # Jump to address 4
+                            with m.Else():
+                                m.d.cpu += pc.eq(pc + 1)  # Normal increment
                         with m.Case(0b110101):  # JNZ 1
                             with m.If(reg_a != 0):
-                                m.d.sync += [
-                                    pc.eq(1),  # Jump to address 1
-                                    jump_flag.eq(1),
-                                ]
+                                m.d.cpu += pc.eq(1)  # Jump to address 1
+                            with m.Else():
+                                m.d.cpu += pc.eq(pc + 1)  # Normal increment
                         with m.Case(0b111000):  # JZ 8
                             with m.If(reg_a == 0):
-                                m.d.sync += [
-                                    pc.eq(8),  # Jump to address 8
-                                    jump_flag.eq(1),
-                                ]
+                                m.d.cpu += pc.eq(8)  # Jump to address 8
+                            with m.Else():
+                                m.d.cpu += pc.eq(pc + 1)  # Normal increment
                         with m.Case(0b111010):  # JNZ 10
                             with m.If(reg_a != 0):
-                                m.d.sync += [
-                                    pc.eq(10),  # Jump to address 10
-                                    jump_flag.eq(1),
-                                ]
-
-            # Increment program counter only if no jump occurred
-            with m.If(~jump_flag):
-                m.d.sync += pc.eq(pc + 1)
+                                m.d.cpu += pc.eq(10)  # Jump to address 10
+                            with m.Else():
+                                m.d.cpu += pc.eq(pc + 1)  # Normal increment
+                        with m.Default():  # Unknown instruction
+                            m.d.cpu += pc.eq(pc + 1)  # Just increment PC
 
         # Connect outputs
         m.d.comb += [
@@ -167,6 +186,13 @@ class SimpleCPU(Elaboratable):
             self.output_valid.eq(output_valid_flag),
             self.halted.eq(halt_flag),
             self.pc_out.eq(pc),
+            # Debug signal connections
+            self.debug_opcode.eq(opcode),
+            self.debug_operand.eq(operand),
+            self.debug_reg_a.eq(reg_a),
+            self.debug_reg_b.eq(reg_b),
+            self.debug_instruction.eq(current_instruction),
+            self.debug_execute_condition.eq(self.run & ~halt_flag),
         ]
 
         return m
@@ -223,6 +249,14 @@ module {module_name} (
   wire cpu_halted;
   wire [3:0] cpu_pc;
   
+  // Debug signals
+  wire [1:0] debug_opcode;
+  wire [3:0] debug_operand;
+  wire [3:0] debug_reg_a;
+  wire [3:0] debug_reg_b;
+  wire [5:0] debug_instruction;
+  wire debug_execute_condition;
+  
   // Instantiate the Amaranth-generated CPU core module
   top cpu_core (
     .clk(clk),
@@ -233,7 +267,14 @@ module {module_name} (
     .output_data(cpu_output_data),    // 4-bit data output
     .output_valid(cpu_output_valid),  // Output valid flag
     .halted(cpu_halted),              // CPU halted flag
-    .pc_out(cpu_pc)                   // Program counter output
+    .pc_out(cpu_pc),                  // Program counter output
+    // Debug signals
+    .debug_opcode(debug_opcode),
+    .debug_operand(debug_operand),
+    .debug_reg_a(debug_reg_a),
+    .debug_reg_b(debug_reg_b),
+    .debug_instruction(debug_instruction),
+    .debug_execute_condition(debug_execute_condition)
   );
   
   // Connect CPU outputs to Tiny Tapeout pins
@@ -242,11 +283,11 @@ module {module_name} (
   assign uo_out[5] = cpu_halted;         // Halted flag on uo_out[5]
   assign uo_out[7:6] = cpu_pc[3:2];      // Upper 2 bits of PC on uo_out[7:6]
   
-  // Use bidirectional pins for additional PC bits  
-  assign uio_out[1:0] = cpu_pc[1:0];     // Lower 2 bits of PC on uio_out[1:0]
-  assign uio_out[7:2] = 6'b0;            // Unused bidirectional outputs
-  assign uio_oe[1:0] = 2'b11;            // Enable PC output on uio[1:0]
-  assign uio_oe[7:2] = 6'b0;             // Other bidirectional pins as inputs
+  // Use bidirectional pins for PC and debug information
+  assign uio_out[1:0] = cpu_pc[1:0];           // Lower 2 bits of PC on uio_out[1:0]
+  assign uio_out[3:2] = debug_opcode;          // Current opcode on uio_out[3:2]
+  assign uio_out[7:4] = debug_operand;         // Current operand on uio_out[7:4]
+  assign uio_oe[7:0] = 8'b11111111;            // All bidirectional pins as outputs for debug
 
   // List all unused inputs to prevent warnings  
   wire _unused = &{{ena, ui_in[7:4], uio_in, 1'b0}};
@@ -273,6 +314,13 @@ if __name__ == "__main__":
             cpu.output_valid,
             cpu.halted,
             cpu.pc_out,
+            # Debug signals
+            cpu.debug_opcode,
+            cpu.debug_operand,
+            cpu.debug_reg_a,
+            cpu.debug_reg_b,
+            cpu.debug_instruction,
+            cpu.debug_execute_condition,
         ],
     )
 
