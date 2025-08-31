@@ -8,7 +8,7 @@ from cocotb.triggers import ClockCycles
 
 @cocotb.test()
 async def test_simple_cpu(dut):
-    dut._log.info("Start Simple 4-bit CPU Test")
+    dut._log.info("Start Simple 4-bit CPU with Conditional Jumps Test")
 
     # Set the clock period to 10 us (100 KHz)
     clock = Clock(dut.clk, 10, units="us")
@@ -52,33 +52,29 @@ async def test_simple_cpu(dut):
     assert halted == 0, f"Expected HALTED=0 after reset, got {halted}"
     assert output_valid == 0, f"Expected OUTPUT_VALID=0 after reset, got {output_valid}"
 
-    # Test 2: Run CPU Program (Counter Program)
-    dut._log.info("Test 2: Run CPU Program")
+    # Test 2: Run CPU Program with Conditional Jumps
+    dut._log.info("Test 2: Run CPU Program with Conditional Jumps")
     await set_cpu_inputs(run=1, reset_cpu=0, prog_sel=0)
 
     expected_sequence = [
-        # PC=0: LOAD A, 1 -> A=1
-        {"pc": 1, "data": 1, "valid": 0},
-        # PC=1: OUTPUT A -> Output A=1, set valid flag
-        {"pc": 2, "data": 1, "valid": 1},
-        # PC=2: ADD A, 1 -> A=2
-        {"pc": 3, "data": 2, "valid": 0},
-        # PC=3: NOP
-        {"pc": 4, "data": 2, "valid": 0},
-        # PC=4-14: NOPs (continue incrementing A and outputting)
-        {"pc": 5, "data": 2, "valid": 0},
-        {"pc": 6, "data": 2, "valid": 0},
-        {"pc": 7, "data": 2, "valid": 0},
-        {"pc": 8, "data": 2, "valid": 0},
-        {"pc": 9, "data": 2, "valid": 0},
-        {"pc": 10, "data": 2, "valid": 0},
-        {"pc": 11, "data": 2, "valid": 0},
-        {"pc": 12, "data": 2, "valid": 0},
-        {"pc": 13, "data": 2, "valid": 0},
-        {"pc": 14, "data": 2, "valid": 0},
-        {"pc": 15, "data": 2, "valid": 0},
-        # PC=15: HALT -> should halt execution
-        {"pc": 15, "data": 2, "valid": 0, "halted": 1},
+        # PC=0: LOAD A, 0 -> A=0
+        {"pc": 1, "data": 0, "valid": 0},
+        # PC=1: JZ 4 -> Jump to 4 (since A=0)
+        {"pc": 4, "data": 0, "valid": 0},
+        # PC=4: LOAD A, 5 -> A=5
+        {"pc": 5, "data": 5, "valid": 0},
+        # PC=5: OUTPUT A -> Output A=5, set valid flag
+        {"pc": 6, "data": 5, "valid": 1},
+        # PC=6: JZ 8 -> Should NOT jump (A=5 != 0), continue to PC=7
+        {"pc": 7, "data": 5, "valid": 0},
+        # PC=7: JNZ 10 -> Jump to 10 (since A=5 != 0)
+        {"pc": 10, "data": 5, "valid": 0},
+        # PC=10: LOAD A, 0 -> A=0
+        {"pc": 11, "data": 0, "valid": 0},
+        # PC=11: OUTPUT A -> Output A=0, set valid flag
+        {"pc": 12, "data": 0, "valid": 1},
+        # PC=12: HALT -> should halt execution
+        {"pc": 12, "data": 0, "valid": 0, "halted": 1},
     ]
 
     for i, expected in enumerate(expected_sequence):
@@ -139,4 +135,4 @@ async def test_simple_cpu(dut):
         f"Expected unused uio_out bits to be 0, got {unused_uio_bits}"
     )
 
-    dut._log.info("✅ All Simple 4-bit CPU tests passed!")
+    dut._log.info("✅ All Simple 4-bit CPU with Conditional Jumps tests passed!")

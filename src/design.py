@@ -12,17 +12,22 @@ class SimpleCPU(Elaboratable):
     - 4-bit data width
     - 2 general-purpose registers (A, B)
     - 4-bit program counter
-    - Simple instruction set with 6 instructions
+    - Enhanced instruction set with 8 instructions including conditional jumps
     - Built-in instruction ROM with 16 instruction slots
 
     Instruction Set (6-bit instructions: 2-bit opcode + 4-bit operand):
     - 00xxxx: NOP - No operation
     - 01xxxx: LOAD A, immediate - Load 4-bit immediate value into register A
     - 10xxxx: ADD A, immediate - Add 4-bit immediate value to register A
-    - 11xx00: MOVE A, B - Copy register A to register B
-    - 11xx01: MOVE B, A - Copy register B to register A
-    - 11xx10: OUTPUT A - Output register A value
-    - 11xx11: HALT - Stop program execution
+    - 110000: MOVE A, B - Copy register A to register B
+    - 110001: MOVE B, A - Copy register B to register A
+    - 110010: OUTPUT A - Output register A value
+    - 110011: HALT - Stop program execution
+    - 110100: JZ 4 - Jump to address 4 if register A == 0
+    - 110101: JNZ 1 - Jump to address 1 if register A != 0
+    - 111000: JZ 8 - Jump to address 8 if register A == 0
+    - 111010: JNZ 10 - Jump to address 10 if register A != 0
+    - (More jump targets can be encoded with different bit patterns)
     """
 
     def __init__(self):
@@ -48,32 +53,32 @@ class SimpleCPU(Elaboratable):
         reg_b = Signal(4)  # Register B
         halt_flag = Signal()  # Halt execution flag
         output_valid_flag = Signal()  # Output valid flag
+        jump_flag = Signal()  # Flag to indicate if a jump occurred this cycle
 
+        # fmt: off
         # Instruction memory - 4 different simple programs
         instruction_mem = Array(
             [
-                # Program 0: Simple counter (counts 0,1,2,3,4... and outputs each)
-                Const(0b010001, 6),  # 0: LOAD A, 1    - Load 1 into A
-                Const(0b110010, 6),  # 1: OUTPUT A     - Output A
-                Const(0b100001, 6),  # 2: ADD A, 1     - Add 1 to A
-                Const(0b000000, 6),  # 3: NOP          - No operation
-                Const(
-                    0b000000, 6
-                ),  # 4: Jump back to 1 (simulated by cycling through all 16)
-                Const(0b000000, 6),  # 5: NOP
-                Const(0b000000, 6),  # 6: NOP
-                Const(0b000000, 6),  # 7: NOP
-                Const(0b000000, 6),  # 8: NOP
-                Const(0b000000, 6),  # 9: NOP
-                Const(0b000000, 6),  # 10: NOP
-                Const(0b000000, 6),  # 11: NOP
-                Const(0b000000, 6),  # 12: NOP
+                # Program 0: Conditional jump demonstration
+                Const(0b010000, 6),  # 0: LOAD A, 0     - Load 0 into A
+                Const(0b110100, 6),  # 1: JZ 4          - Jump to 4 if A == 0 (should jump)
+                Const(0b110010, 6),  # 2: OUTPUT A      - Should NOT execute (skipped by jump)
+                Const(0b110011, 6),  # 3: HALT          - Should NOT execute (skipped by jump)
+                Const(0b010101, 6),  # 4: LOAD A, 5     - Load 5 into A
+                Const(0b110010, 6),  # 5: OUTPUT A      - Output 5
+                Const(0b111000, 6),  # 6: JZ 8          - Should NOT jump (A=5 != 0)
+                Const(0b111010, 6),  # 7: JNZ 10        - Should jump to 10 (A=5 != 0)
+                Const(0b110011, 6),  # 8: HALT          - Should NOT execute
+                Const(0b110011, 6),  # 9: HALT          - Should NOT execute  
+                Const(0b010000, 6),  # 10: LOAD A, 0    - Load 0 into A
+                Const(0b110010, 6),  # 11: OUTPUT A     - Output 0
+                Const(0b110011, 6),  # 12: HALT         - Final halt
                 Const(0b000000, 6),  # 13: NOP
                 Const(0b000000, 6),  # 14: NOP
-                Const(0b110011, 6),  # 15: HALT        - Stop execution
+                Const(0b000000, 6),  # 15: NOP
             ]
         )
-
+        # fmt: on
         # Alternative programs could be selected with program_select
         # For now, we'll use the same program but could extend this
 
@@ -98,10 +103,11 @@ class SimpleCPU(Elaboratable):
                 reg_b.eq(0),
                 halt_flag.eq(0),
                 output_valid_flag.eq(0),
+                jump_flag.eq(0),
             ]
         with m.Elif(self.run & ~halt_flag):
-            # Clear output valid flag by default
-            m.d.sync += output_valid_flag.eq(0)
+            # Clear output valid and jump flags by default
+            m.d.sync += [output_valid_flag.eq(0), jump_flag.eq(0)]
 
             # Execute instruction based on opcode
             with m.Switch(opcode):
@@ -115,18 +121,45 @@ class SimpleCPU(Elaboratable):
                     m.d.sync += reg_a.eq(reg_a + operand)
 
                 with m.Case(0b11):  # Extended instructions
-                    with m.Switch(operand[0:2]):  # Use bottom 2 bits of operand
-                        with m.Case(0b00):  # MOVE A, B
+                    with m.Switch(
+                        current_instruction
+                    ):  # Use full 6-bit instruction for extended instructions
+                        with m.Case(0b110000):  # MOVE A, B
                             m.d.sync += reg_b.eq(reg_a)
-                        with m.Case(0b01):  # MOVE B, A
+                        with m.Case(0b110001):  # MOVE B, A
                             m.d.sync += reg_a.eq(reg_b)
-                        with m.Case(0b10):  # OUTPUT A
+                        with m.Case(0b110010):  # OUTPUT A
                             m.d.sync += output_valid_flag.eq(1)
-                        with m.Case(0b11):  # HALT
+                        with m.Case(0b110011):  # HALT
                             m.d.sync += halt_flag.eq(1)
+                        with m.Case(0b110100):  # JZ 4
+                            with m.If(reg_a == 0):
+                                m.d.sync += [
+                                    pc.eq(4),  # Jump to address 4
+                                    jump_flag.eq(1),
+                                ]
+                        with m.Case(0b110101):  # JNZ 1
+                            with m.If(reg_a != 0):
+                                m.d.sync += [
+                                    pc.eq(1),  # Jump to address 1
+                                    jump_flag.eq(1),
+                                ]
+                        with m.Case(0b111000):  # JZ 8
+                            with m.If(reg_a == 0):
+                                m.d.sync += [
+                                    pc.eq(8),  # Jump to address 8
+                                    jump_flag.eq(1),
+                                ]
+                        with m.Case(0b111010):  # JNZ 10
+                            with m.If(reg_a != 0):
+                                m.d.sync += [
+                                    pc.eq(10),  # Jump to address 10
+                                    jump_flag.eq(1),
+                                ]
 
-            # Increment program counter
-            m.d.sync += pc.eq(pc + 1)
+            # Increment program counter only if no jump occurred
+            with m.If(~jump_flag):
+                m.d.sync += pc.eq(pc + 1)
 
         # Connect outputs
         m.d.comb += [
